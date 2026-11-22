@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -350,8 +351,21 @@ func fluxSpace(space string, dev bool, r genReq) (genRes, error) {
 // limite practico, y la clasica (image.pollinations.ai) sin key pero limitada a
 // una imagen cada 45s por IP. Con key se usa la nueva.
 func genPollinations(r genReq) (genRes, error) {
-	key := r.pollKeyValue()
+	if key := r.pollKeyValue(); key != "" {
+		res, err := pollNew(r, key)
+		// con la cuenta sin saldo la API nueva devuelve 402 en todo. La clasica
+		// no pide key y sigue andando (una imagen cada 45s), asi que es mejor
+		// una imagen lenta que un error.
+		if err == nil || !strings.Contains(err.Error(), "Insufficient balance") {
+			return res, err
+		}
+		log.Printf("pollinations sin saldo, se cae a la api clasica: %v", err)
+	}
+	return pollClassic(r)
+}
 
+// pollNew es la API nueva (gen.pollinations.ai), con Bearer y sin limite practico.
+func pollNew(r genReq, key string) (genRes, error) {
 	q := url.Values{}
 	q.Set("width", strconv.Itoa(r.Width))
 	q.Set("height", strconv.Itoa(r.Height))
@@ -361,30 +375,54 @@ func genPollinations(r genReq) (genRes, error) {
 	if r.Model != "" {
 		q.Set("model", r.Model)
 	}
+	endpoint := "https://gen.pollinations.ai/image/" + url.PathEscape(r.Prompt) + "?" + q.Encode()
+	return pollFetch(endpoint, key, r.Model)
+}
 
-	var endpoint, bearer string
-	if key != "" {
-		endpoint = "https://gen.pollinations.ai/image/" + url.PathEscape(r.Prompt) + "?" + q.Encode()
-		bearer = key
-	} else {
-		// sin key hay que respetar el minuto entre llamados, o da 402
-		q.Set("nologo", "true")
-		endpoint = "https://image.pollinations.ai/prompt/" + url.PathEscape(r.Prompt) + "?" + q.Encode()
-		if minGapMs > 0 {
-			pollMu.Lock()
-			if !lastPoll.IsZero() {
-				if wait := time.Duration(minGapMs)*time.Millisecond - time.Since(lastPoll); wait > 0 {
-					pollMu.Unlock()
-					time.Sleep(wait)
-					pollMu.Lock()
-				}
+// pollClassic es la API clasica (image.pollinations.ai): sin key, una imagen
+// cada 45s por IP. Con 402 FREE_LIMIT conviene esperar y reintentar en vez de
+// fallar, porque el limite se renueva solo.
+func pollClassic(r genReq) (genRes, error) {
+	q := url.Values{}
+	q.Set("width", strconv.Itoa(r.Width))
+	q.Set("height", strconv.Itoa(r.Height))
+	q.Set("nologo", "true")
+	if r.Seed != 0 {
+		q.Set("seed", strconv.FormatInt(r.Seed, 10))
+	}
+	if r.Model != "" {
+		q.Set("model", r.Model)
+	}
+	if minGapMs > 0 {
+		pollMu.Lock()
+		if !lastPoll.IsZero() {
+			if wait := time.Duration(minGapMs)*time.Millisecond - time.Since(lastPoll); wait > 0 {
+				pollMu.Unlock()
+				time.Sleep(wait)
+				pollMu.Lock()
 			}
-			lastPoll = time.Now()
-			pollMu.Unlock()
+		}
+		lastPoll = time.Now()
+		pollMu.Unlock()
+	}
+	endpoint := "https://image.pollinations.ai/prompt/" + url.PathEscape(r.Prompt) + "?" + q.Encode()
+	return pollFetch(endpoint, "", r.Model)
+}
+
+// retryAfter saca "Retry after Ns" del cuerpo de pollinations; si no esta, usa def.
+func retryAfter(body []byte, def int) time.Duration {
+	if m := freeLimitRe.FindSubmatch(body); len(m) == 2 {
+		if n, err := strconv.Atoi(string(m[1])); err == nil && n > 0 && n <= 120 {
+			return time.Duration(n+1) * time.Second
 		}
 	}
+	return time.Duration(def) * time.Second
+}
 
-	// 503 y 502 son saturacion transitoria: vale reintentar antes de rendirse
+var freeLimitRe = regexp.MustCompile(`Retry after ([0-9]+)s`)
+
+// pollFetch hace el GET con reintentos. 502/503/429 son saturacion transitoria.
+func pollFetch(endpoint, bearer, model string) (genRes, error) {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
@@ -409,6 +447,13 @@ func genPollinations(r genReq) (genRes, error) {
 			lastErr = fmt.Errorf("pollinations HTTP %d: %s", resp.StatusCode, truncate(string(data), 150))
 			continue
 		}
+		// la clasica sin key devuelve 402 FREE_LIMIT (1 imagen cada 45s por IP);
+		// esperar lo que pide el servidor rinde mas que fallar el pedido
+		if resp.StatusCode == 402 && strings.Contains(string(data), "FREE_LIMIT") && attempt < 2 {
+			lastErr = fmt.Errorf("pollinations HTTP 402: %s", truncate(string(data), 150))
+			time.Sleep(retryAfter(data, 45))
+			continue
+		}
 		if resp.StatusCode != 200 {
 			return genRes{}, fmt.Errorf("pollinations HTTP %d: %s", resp.StatusCode, truncate(string(data), 200))
 		}
@@ -416,7 +461,6 @@ func genPollinations(r genReq) (genRes, error) {
 			lastErr = fmt.Errorf("pollinations no devolvio imagen: %s", truncate(string(data), 150))
 			continue
 		}
-		model := r.Model
 		if model == "" {
 			model = "flux"
 		}
