@@ -20,5 +20,9 @@ services:
       CACHE_TTL: ${CACHE_TTL:-604800}
       # espera maxima por imagen
       GEN_TIMEOUT: ${GEN_TIMEOUT:-180}
+      # techo de pixeles por imagen (la API nueva de pollinations rechaza mas)
+      MAX_PIXELS: ${MAX_PIXELS:-2300000}
+      # espera minima entre llamados a pollinations sin token
+      POLLINATIONS_MIN_GAP_MS: ${POLLINATIONS_MIN_GAP_MS:-45000}
     volumes:
       - ./data:/data
