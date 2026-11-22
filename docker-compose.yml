@@ -1,0 +1,24 @@
+services:
+  imgapi:
+    build: .
+    container_name: imgapi
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # proveedores en orden de intento; el primero que responda gana
+      PROVIDER_ORDER: ${PROVIDER_ORDER:-flux,pollinations,horde}
+      # token de HuggingFace (gratis): sube mucho la cuota de FLUX
+      HF_TOKEN: ${HF_TOKEN:-}
+      # token de pollinations (opcional): saca el limite de 1 imagen cada 45s
+      POLLINATIONS_TOKEN: ${POLLINATIONS_TOKEN:-}
+      # apikey anonima de stable horde
+      HORDE_API_KEY: ${HORDE_API_KEY:-0000000000}
+      # si la pones, todas las peticiones a /generate la exigen
+      API_KEY: ${API_KEY:-}
+      # segundos que una imagen queda en cache (7 dias)
+      CACHE_TTL: ${CACHE_TTL:-604800}
+      # espera maxima por imagen
+      GEN_TIMEOUT: ${GEN_TIMEOUT:-180}
+    volumes:
+      - ./data:/data
