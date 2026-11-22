@@ -82,16 +82,32 @@
 
     <div class="row">
       <div>
-        <label for="w">Ancho</label>
-        <input id="w" type="number" value="1024" min="256" max="2048" step="8">
-      </div>
-      <div>
-        <label for="h">Alto</label>
-        <input id="h" type="number" value="1024" min="256" max="2048" step="8">
+        <label for="size">Tamano</label>
+        <select id="size">
+          <option value="512x512">512 x 512 (rapido)</option>
+          <option value="576x576">576 x 576 (max anonimo de horde)</option>
+          <option value="768x768">768 x 768</option>
+          <option value="1024x1024" selected>1024 x 1024 (cuadrado)</option>
+          <option value="1280x720">1280 x 720 (16:9)</option>
+          <option value="1920x1080">1920 x 1080 (full hd)</option>
+          <option value="720x1280">720 x 1280 (vertical)</option>
+          <option value="custom">personalizado</option>
+        </select>
       </div>
       <div>
         <label for="seed">Seed</label>
         <input id="seed" type="number" value="0" min="0" placeholder="0 = aleatorio">
+      </div>
+    </div>
+
+    <div class="row" id="customRow" style="display:none">
+      <div>
+        <label for="w">Ancho (multiplo de 64)</label>
+        <input id="w" type="number" value="1024" min="256" max="2048" step="64">
+      </div>
+      <div>
+        <label for="h">Alto (multiplo de 64)</label>
+        <input id="h" type="number" value="1024" min="256" max="2048" step="64">
       </div>
     </div>
 
@@ -106,10 +122,33 @@
         </select>
       </div>
       <div>
-        <label for="key">API key (si esta configurada)</label>
+        <label for="key">API key del servicio (si esta configurada)</label>
         <input id="key" placeholder="opcional" autocomplete="off">
       </div>
     </div>
+
+    <label style="display:flex; align-items:center; gap:8px; margin-top:14px; font-weight:400">
+      <input id="cache" type="checkbox" checked style="width:auto">
+      Usar cache (destildalo para que genere una imagen nueva aunque el prompt sea el mismo)
+    </label>
+
+    <details style="margin-top:16px">
+      <summary style="cursor:pointer; color:var(--muted); font-size:14px">Claves de los proveedores (opcional, no se guardan)</summary>
+      <div class="row" style="margin-top:12px">
+        <div>
+          <label for="hfk">HuggingFace token (flux)</label>
+          <input id="hfk" placeholder="hf_..." autocomplete="off">
+        </div>
+        <div>
+          <label for="pollk">Pollinations token</label>
+          <input id="pollk" placeholder="opcional" autocomplete="off">
+        </div>
+      </div>
+      <div style="margin-top:12px">
+        <label for="hordek">Stable Horde key</label>
+        <input id="hordek" placeholder="0000000000 = anonima" autocomplete="off">
+      </div>
+    </details>
 
     <button id="go">Generar imagen</button>
     <div id="out"></div>
@@ -124,6 +163,12 @@ curl "http://TU_IP:8080/generate?prompt=un+gato+negro&amp;seed=42" -o gato.jpg
 
 # forzando un proveedor
 curl "http://TU_IP:8080/generate?prompt=un+gato+negro&amp;provider=horde" -o gato.jpg
+
+# sin cache: genera una imagen nueva aunque el prompt sea el mismo
+curl "http://TU_IP:8080/generate?prompt=un+gato+negro&amp;cache=0" -o gato.jpg
+
+# con tus propias claves, sin tocar el .env
+curl "http://TU_IP:8080/generate?prompt=un+gato+negro&amp;hf_token=hf_xxx&amp;provider=flux" -o gato.jpg
 
 # respuesta JSON con la url de la imagen
 curl "http://TU_IP:8080/generate?prompt=un+gato+negro&amp;format=json"
@@ -142,13 +187,16 @@ curl -H "X-API-Key: tu_clave" "http://TU_IP:8080/generate?prompt=un+gato+negro" 
     <code>GET /stats</code> contadores.
   </p>
   <p class="note">
-    Parametros: <code>prompt</code> (obligatorio), <code>width</code>, <code>height</code> (256 a 2048, multiplos de 8),
-    <code>seed</code>, <code>model</code>, <code>provider</code>, <code>format=json</code>, <code>b64=1</code>.
+    Parametros: <code>prompt</code> (obligatorio), <code>width</code>, <code>height</code> (256 a 2048, se redondea a
+    multiplo de 64 porque horde lo exige), <code>seed</code>, <code>model</code>, <code>provider</code>,
+    <code>cache=0</code>, <code>format=json</code>, <code>b64=1</code>.
+    Claves por llamado: <code>hf_token</code>, <code>pollinations_token</code>, <code>horde_token</code>.
     En POST se acepta JSON con esos mismos campos.
   </p>
   <p class="note">
     Cache: la misma combinacion de prompt, tamano, seed y proveedor no se vuelve a generar. Vive en disco y
-    sobrevive a los reinicios. Se controla con <code>CACHE_TTL</code>.
+    sobrevive a los reinicios. Se controla con <code>CACHE_TTL</code>. Con <code>cache=0</code> se saltea
+    tanto la lectura como la escritura, asi que cada llamado da una imagen nueva.
   </p>
 </div>
 
@@ -156,14 +204,33 @@ curl -H "X-API-Key: tu_clave" "http://TU_IP:8080/generate?prompt=un+gato+negro" 
 const $ = (id) => document.getElementById(id);
 const out = $('out');
 
+$('size').addEventListener('change', () => {
+  const custom = $('size').value === 'custom';
+  $('customRow').style.display = custom ? '' : 'none';
+  if (!custom) {
+    const [w, h] = $('size').value.split('x');
+    $('w').value = w;
+    $('h').value = h;
+  }
+});
+
 $('go').addEventListener('click', async () => {
   const prompt = $('prompt').value.trim();
   if (!prompt) { out.innerHTML = '<div class="err">Falta el prompt.</div>'; return; }
 
-  const p = new URLSearchParams({ prompt, width: $('w').value, height: $('h').value });
+  // el server redondea a multiplo de 64; horde rechaza cualquier otra medida
+  const r64 = (v) => Math.max(256, Math.min(2048, Math.round(v / 64) * 64));
+  const w = r64(parseInt($('w').value || '1024', 10));
+  const h = r64(parseInt($('h').value || '1024', 10));
+
+  const p = new URLSearchParams({ prompt, width: w, height: h });
   if ($('seed').value && $('seed').value !== '0') p.set('seed', $('seed').value);
   if ($('prov').value) p.set('provider', $('prov').value);
   if ($('key').value) p.set('key', $('key').value);
+  if (!$('cache').checked) p.set('cache', '0');
+  if ($('hfk').value) p.set('hf_token', $('hfk').value);
+  if ($('pollk').value) p.set('pollinations_token', $('pollk').value);
+  if ($('hordek').value) p.set('horde_token', $('hordek').value);
 
   const btn = $('go');
   btn.disabled = true;

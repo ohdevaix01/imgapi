@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"net/http"
 	"net/url"
@@ -43,6 +44,9 @@ var (
 	pollKey   = os.Getenv("POLLINATIONS_TOKEN")
 	order     = strings.Split(env("PROVIDER_ORDER", "flux,pollinations,horde"), ",")
 	minGapMs  = envInt("POLLINATIONS_MIN_GAP_MS", 45000)
+	// techo de pixeles medido en la API nueva de pollinations; mas que esto
+	// devuelve 422
+	maxPixels = envInt("MAX_PIXELS", 2300000)
 
 	mu        sync.RWMutex
 	stats     Stats
@@ -133,6 +137,37 @@ type genReq struct {
 	Seed     int64
 	Model    string
 	Provider string
+	// claves que puede mandar el cliente en cada llamado, pisan a las del .env
+	HFToken    string
+	PollToken  string
+	HordeToken string
+	// Cache en false saltea la cache: genera siempre una imagen nueva
+	Cache bool
+	// formato de salida, se pueden pedir por query o por body
+	Format string
+	B64    bool
+}
+
+// hfKey resuelve el token: el del request gana sobre el del entorno.
+func (r genReq) hfKey() string {
+	if r.HFToken != "" {
+		return r.HFToken
+	}
+	return hfToken
+}
+
+func (r genReq) pollKeyValue() string {
+	if r.PollToken != "" {
+		return r.PollToken
+	}
+	return pollKey
+}
+
+func (r genReq) hordeKeyValue() string {
+	if r.HordeToken != "" {
+		return r.HordeToken
+	}
+	return env("HORDE_API_KEY", "0000000000")
 }
 
 type genRes struct {
@@ -161,8 +196,8 @@ func genFlux(r genReq) (genRes, error) {
 		return genRes{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if hfToken != "" {
-		req.Header.Set("Authorization", "Bearer "+hfToken)
+	if k := r.hfKey(); k != "" {
+		req.Header.Set("Authorization", "Bearer "+k)
 	}
 
 	client := &http.Client{Timeout: 60 * time.Second}
@@ -184,8 +219,8 @@ func genFlux(r genReq) (genRes, error) {
 	}
 
 	sseReq, _ := http.NewRequest("GET", space+"/gradio_api/call/infer/"+started.EventID, nil)
-	if hfToken != "" {
-		sseReq.Header.Set("Authorization", "Bearer "+hfToken)
+	if k := r.hfKey(); k != "" {
+		sseReq.Header.Set("Authorization", "Bearer "+k)
 	}
 	sseResp, err := (&http.Client{Timeout: genTO}).Do(sseReq)
 	if err != nil {
@@ -230,8 +265,8 @@ func genFlux(r genReq) (genRes, error) {
 			target = space + target
 		}
 		imgReq, _ := http.NewRequest("GET", target, nil)
-		if hfToken != "" {
-			imgReq.Header.Set("Authorization", "Bearer "+hfToken)
+		if k := r.hfKey(); k != "" {
+			imgReq.Header.Set("Authorization", "Bearer "+k)
 		}
 		imgResp, err := (&http.Client{Timeout: 90 * time.Second}).Do(imgReq)
 		if err != nil {
@@ -247,37 +282,43 @@ func genFlux(r genReq) (genRes, error) {
 	return genRes{}, fmt.Errorf("flux: stream sin imagen utilizable")
 }
 
-// pollinations es un GET simple. Sin token: 1 imagen cada 45s por IP.
+// pollinations tiene dos APIs: la nueva (gen.pollinations.ai) con Bearer y sin
+// limite practico, y la clasica (image.pollinations.ai) sin key pero limitada a
+// una imagen cada 45s por IP. Con key se usa la nueva.
 func genPollinations(r genReq) (genRes, error) {
-	if minGapMs > 0 {
-		pollMu.Lock()
-		if !lastPoll.IsZero() {
-			wait := time.Duration(minGapMs)*time.Millisecond - time.Since(lastPoll)
-			if wait > 0 {
-				pollMu.Unlock()
-				time.Sleep(wait)
-				pollMu.Lock()
-			}
-		}
-		lastPoll = time.Now()
-		pollMu.Unlock()
-	}
+	key := r.pollKeyValue()
 
 	q := url.Values{}
 	q.Set("width", strconv.Itoa(r.Width))
 	q.Set("height", strconv.Itoa(r.Height))
-	q.Set("nologo", "true")
 	if r.Seed != 0 {
 		q.Set("seed", strconv.FormatInt(r.Seed, 10))
-	}
-	if pollKey != "" {
-		q.Set("token", pollKey)
 	}
 	if r.Model != "" {
 		q.Set("model", r.Model)
 	}
 
-	endpoint := "https://image.pollinations.ai/prompt/" + url.PathEscape(r.Prompt) + "?" + q.Encode()
+	var endpoint, bearer string
+	if key != "" {
+		endpoint = "https://gen.pollinations.ai/image/" + url.PathEscape(r.Prompt) + "?" + q.Encode()
+		bearer = key
+	} else {
+		// sin key hay que respetar el minuto entre llamados, o da 402
+		q.Set("nologo", "true")
+		endpoint = "https://image.pollinations.ai/prompt/" + url.PathEscape(r.Prompt) + "?" + q.Encode()
+		if minGapMs > 0 {
+			pollMu.Lock()
+			if !lastPoll.IsZero() {
+				if wait := time.Duration(minGapMs)*time.Millisecond - time.Since(lastPoll); wait > 0 {
+					pollMu.Unlock()
+					time.Sleep(wait)
+					pollMu.Lock()
+				}
+			}
+			lastPoll = time.Now()
+			pollMu.Unlock()
+		}
+	}
 
 	// 503 y 502 son saturacion transitoria: vale reintentar antes de rendirse
 	var lastErr error
@@ -285,7 +326,11 @@ func genPollinations(r genReq) (genRes, error) {
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt*6) * time.Second)
 		}
-		resp, err := (&http.Client{Timeout: genTO}).Get(endpoint)
+		req, _ := http.NewRequest("GET", endpoint, nil)
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		resp, err := (&http.Client{Timeout: genTO}).Do(req)
 		if err != nil {
 			lastErr = err
 			continue
@@ -314,17 +359,21 @@ func genPollinations(r genReq) (genRes, error) {
 
 // horde es asincrono: se manda el job y se consulta hasta que termina.
 func genHorde(r genReq) (genRes, error) {
-	key := env("HORDE_API_KEY", "0000000000")
-	// con la apikey anonima el presupuesto de kudos solo alcanza hasta 576x576
-	w, h := r.Width, r.Height
-	if key == "0000000000" {
-		if w > 576 {
-			w = 576
-		}
-		if h > 576 {
-			h = 576
+	key := r.hordeKeyValue()
+
+	// sin kudos suficientes horde rechaza lo que pase de 576x576; en vez de
+	// adivinar, se intenta y si lo rechaza se reenvia chico
+	res, err := hordeJob(r, key, r.Width, r.Height)
+	if err != nil && strings.Contains(err.Error(), "kudos") {
+		w, h := min(576, r.Width), min(576, r.Height)
+		if w != r.Width || h != r.Height {
+			return hordeJob(r, key, w, h)
 		}
 	}
+	return res, err
+}
+
+func hordeJob(r genReq, key string, w, h int) (genRes, error) {
 	payload, _ := json.Marshal(map[string]any{
 		"prompt": r.Prompt,
 		"params": map[string]any{
@@ -472,7 +521,7 @@ func authorized(r *http.Request) bool {
 
 // parseReq acepta GET con query y POST con JSON.
 func parseReq(r *http.Request) (genReq, error) {
-	out := genReq{Width: 1024, Height: 1024}
+	out := genReq{Width: 1024, Height: 1024, Cache: true}
 
 	if r.Method == "POST" {
 		var body struct {
@@ -482,6 +531,12 @@ func parseReq(r *http.Request) (genReq, error) {
 			Seed           int64  `json:"seed"`
 			Model          string `json:"model"`
 			Provider       string `json:"provider"`
+			HFToken        string `json:"hf_token"`
+			PollToken      string `json:"pollinations_token"`
+			HordeToken     string `json:"horde_token"`
+			Cache          *bool  `json:"cache"`
+			Format         string `json:"format"`
+			B64            bool   `json:"b64"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			return out, fmt.Errorf("json invalido")
@@ -496,6 +551,14 @@ func parseReq(r *http.Request) (genReq, error) {
 		out.Seed = body.Seed
 		out.Model = body.Model
 		out.Provider = body.Provider
+		out.HFToken = body.HFToken
+		out.PollToken = body.PollToken
+		out.HordeToken = body.HordeToken
+		if body.Cache != nil {
+			out.Cache = *body.Cache
+		}
+		out.Format = body.Format
+		out.B64 = body.B64
 	} else {
 		q := r.URL.Query()
 		out.Prompt = q.Get("prompt")
@@ -515,6 +578,16 @@ func parseReq(r *http.Request) (genReq, error) {
 			}
 		}
 		out.Model = q.Get("model")
+		out.Provider = q.Get("provider")
+		out.HFToken = q.Get("hf_token")
+		out.PollToken = q.Get("pollinations_token")
+		out.HordeToken = q.Get("horde_token")
+		// cache=0 desactiva tanto la lectura como la escritura
+		if v := q.Get("cache"); v != "" {
+			out.Cache = v != "0" && v != "false" && v != "no"
+		}
+		out.Format = q.Get("format")
+		out.B64 = q.Get("b64") == "1"
 	}
 
 	out.Prompt = strings.TrimSpace(out.Prompt)
@@ -526,10 +599,38 @@ func parseReq(r *http.Request) (genReq, error) {
 	}
 	out.Width = clamp(out.Width, 256, 2048)
 	out.Height = clamp(out.Height, 256, 2048)
-	// multiples de 8, que es lo que esperan los modelos
-	out.Width = out.Width / 8 * 8
-	out.Height = out.Height / 8 * 8
+	// horde exige multiplos de 64; redondear al mas cercano conserva mejor la
+	// proporcion que truncar
+	out.Width = round64(out.Width)
+	out.Height = round64(out.Height)
+	out.Width, out.Height = limitPixels(out.Width, out.Height, maxPixels)
 	return out, nil
+}
+
+func round64(v int) int {
+	n := int(math.Round(float64(v)/64)) * 64
+	return clamp(n, 256, 2048)
+}
+
+// limitPixels achica el par manteniendo la proporcion, para no pasar el techo
+// de pixeles que acepta el proveedor.
+func limitPixels(w, h, maxPx int) (int, int) {
+	if w*h <= maxPx {
+		return w, h
+	}
+	scale := math.Sqrt(float64(maxPx) / float64(w*h))
+	w = round64(int(float64(w) * scale))
+	h = round64(int(float64(h) * scale))
+	for w*h > maxPx && (w > 256 || h > 256) {
+		if w >= h && w > 256 {
+			w -= 64
+		} else if h > 256 {
+			h -= 64
+		} else {
+			break
+		}
+	}
+	return w, h
 }
 
 func clamp(v, lo, hi int) int {
@@ -575,8 +676,8 @@ func handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wantJSON := r.URL.Query().Get("format") == "json"
-	wantB64 := r.URL.Query().Get("b64") == "1"
+	wantJSON := req.Format == "json"
+	wantB64 := req.B64
 
 	// el proveedor forzado entra en la clave: pedir horde no debe devolver
 	// una imagen cacheada de flux
@@ -587,12 +688,14 @@ func handleGenerate(w http.ResponseWriter, r *http.Request) {
 	stats.Requests++
 	mu.Unlock()
 
-	if p, ok := findCached(key); ok {
-		mu.Lock()
-		stats.CacheHits++
-		mu.Unlock()
-		serveFile(w, r, p, req, "cache", time.Since(start), wantJSON, wantB64)
-		return
+	if req.Cache {
+		if p, ok := findCached(key); ok {
+			mu.Lock()
+			stats.CacheHits++
+			mu.Unlock()
+			serveFile(w, r, p, req, "cache", time.Since(start), wantJSON, wantB64)
+			return
+		}
 	}
 
 	res, failures := generate(req, only)
@@ -610,7 +713,10 @@ func handleGenerate(w http.ResponseWriter, r *http.Request) {
 
 	ext, mimeType := sniffExt(res.Data)
 	_ = mimeType
-	p := storeCached(key, ext, res.Data)
+	p := ""
+	if req.Cache {
+		p = storeCached(key, ext, res.Data)
+	}
 
 	mu.Lock()
 	stats.Generated++
@@ -620,11 +726,8 @@ func handleGenerate(w http.ResponseWriter, r *http.Request) {
 		serveFile(w, r, p, req, res.Provider, time.Since(start), wantJSON, wantB64)
 		return
 	}
-
-	cors(w)
-	w.Header().Set("Content-Type", mimeType)
-	w.Header().Set("X-Provider", res.Provider)
-	w.Write(res.Data)
+	// sin cache no hay archivo que servir: se responde con los bytes en mano
+	serveBytes(w, r, res.Data, req, res.Provider, time.Since(start), wantJSON, wantB64, "")
 }
 
 func serveFile(w http.ResponseWriter, r *http.Request, path string, req genReq, provider string, took time.Duration, wantJSON, wantB64 bool) {
@@ -633,9 +736,18 @@ func serveFile(w http.ResponseWriter, r *http.Request, path string, req genReq, 
 		writeJSON(w, 500, map[string]string{"error": "no se pudo leer la imagen"})
 		return
 	}
+	id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	serveBytes(w, r, data, req, provider, took, wantJSON, wantB64, id)
+}
+
+// serveBytes arma la respuesta; con id vacio la imagen no quedo guardada.
+func serveBytes(w http.ResponseWriter, r *http.Request, data []byte, req genReq, provider string, took time.Duration, wantJSON, wantB64 bool, id string) {
 	_, mimeType := sniffExt(data)
+	if mimeType == "" && id != "" {
+		mimeType = mime.TypeByExtension(filepath.Ext(id))
+	}
 	if mimeType == "" {
-		mimeType = mime.TypeByExtension(filepath.Ext(path))
+		mimeType = "application/octet-stream"
 	}
 
 	if wantB64 || wantJSON {
@@ -648,10 +760,11 @@ func serveFile(w http.ResponseWriter, r *http.Request, path string, req genReq, 
 			"took_ms":  int(took.Milliseconds()),
 			"mime":     mimeType,
 		}
-		if wantB64 {
+		// sin id no hay url permanente, asi que va siempre el base64
+		if wantB64 || id == "" {
 			out["image_base64"] = base64.StdEncoding.EncodeToString(data)
 		} else {
-			out["image_url"] = "/image/" + strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+			out["image_url"] = "/image/" + id
 		}
 		writeJSON(w, 200, out)
 		return
