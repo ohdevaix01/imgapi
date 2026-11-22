@@ -178,24 +178,56 @@ func (r genReq) hordeKeyValue() string {
 type genRes struct {
 	Data     []byte
 	Provider string
+	// motor real que genero la imagen (flux.1-dev, Juggernaut XL, ...)
+	Model string
 }
 
-// flux usa el Space publico de HuggingFace por su API de Gradio (HTTP puro).
-// Con HF_TOKEN la cuota de ZeroGPU es mucho mayor.
+// flux usa los Spaces publicos de HuggingFace por su API de Gradio (HTTP puro).
+// dev es el modelo completo: con guidance_scale sigue el prompt mucho mejor que
+// schnell, que es destilado y corre con CFG 0. Se prefiere dev y se cae a
+// schnell cuando la cuota ZeroGPU de dev se agota.
 func genFlux(r genReq) (genRes, error) {
-	space := env("FLUX_SPACE", "https://black-forest-labs-flux-1-schnell.hf.space")
+	tiers := []struct {
+		space string
+		dev   bool
+	}{
+		{env("FLUX_SPACE", "https://black-forest-labs-flux-1-dev.hf.space"), true},
+		{env("FLUX_SPACE_FALLBACK", "https://black-forest-labs-flux-1-schnell.hf.space"), false},
+	}
+
+	var lastErr error
+	for _, t := range tiers {
+		res, err := fluxSpace(t.space, t.dev, r)
+		if err == nil {
+			if t.dev {
+				res.Model = "flux.1-dev"
+			} else {
+				res.Model = "flux.1-schnell"
+			}
+			return res, nil
+		}
+		lastErr = err
+		// sin cuota no tiene sentido insistir con el mismo Space
+		if !strings.Contains(err.Error(), "quota") && !strings.Contains(err.Error(), "ZeroGPU") {
+			break
+		}
+	}
+	return genRes{}, lastErr
+}
+
+// fluxSpace ejecuta un Space de FLUX por la API de Gradio: se encola el job y el
+// resultado llega por /queue/data?session_hash=..., con msg=process_completed.
+func fluxSpace(space string, dev bool, r genReq) (genRes, error) {
 	session := fmt.Sprintf("imgapi%d", time.Now().UnixNano())
-	body, _ := json.Marshal(map[string]any{
-		"data": []any{
-			r.Prompt,
-			float64(r.Seed),
-			r.Seed == 0,
-			float64(r.Width),
-			float64(r.Height),
-			4,
-		},
-		"session_hash": session,
-	})
+	var data []any
+	if dev {
+		// prompt, seed, randomize_seed, width, height, guidance_scale, steps
+		data = []any{r.Prompt, float64(r.Seed), r.Seed == 0, float64(r.Width), float64(r.Height), 3.5, 28}
+	} else {
+		// prompt, seed, randomize_seed, width, height, steps
+		data = []any{r.Prompt, float64(r.Seed), r.Seed == 0, float64(r.Width), float64(r.Height), 4}
+	}
+	body, _ := json.Marshal(map[string]any{"data": data, "session_hash": session})
 
 	req, err := http.NewRequest("POST", space+"/gradio_api/call/infer", bytes.NewReader(body))
 	if err != nil {
@@ -223,9 +255,9 @@ func genFlux(r genReq) (genRes, error) {
 		return genRes{}, fmt.Errorf("flux sin event_id: %s", truncate(string(raw), 200))
 	}
 
-	// gradio cambio el protocolo: el resultado ya no sale por
-	// /call/<fn>/<event_id> sino por /queue/data?session_hash=..., con
-	// msg=process_completed y la imagen adentro de output.data.
+	// el resultado ya no sale por /call/<fn>/<event_id> sino por
+	// /queue/data?session_hash=..., con msg=process_completed y la imagen adentro
+	// de output.data
 	sseReq, _ := http.NewRequest("GET", space+"/gradio_api/queue/data?session_hash="+session, nil)
 	if k := r.hfKey(); k != "" {
 		sseReq.Header.Set("Authorization", "Bearer "+k)
@@ -278,7 +310,6 @@ func genFlux(r genReq) (genRes, error) {
 			if len(msg.Output.Data) == 0 {
 				return genRes{}, fmt.Errorf("flux: respuesta sin imagen")
 			}
-			// el primer elemento es el archivo; los demas son escalares (seed)
 			var file struct {
 				URL  string `json:"url"`
 				Path string `json:"path"`
@@ -289,9 +320,6 @@ func genFlux(r genReq) (genRes, error) {
 			target := file.URL
 			if target == "" {
 				target = space + "/gradio_api/file=" + file.Path
-			}
-			if target == "" {
-				return genRes{}, fmt.Errorf("flux: sin url de imagen")
 			}
 			if strings.HasPrefix(target, "/") {
 				target = space + target
@@ -388,7 +416,11 @@ func genPollinations(r genReq) (genRes, error) {
 			lastErr = fmt.Errorf("pollinations no devolvio imagen: %s", truncate(string(data), 150))
 			continue
 		}
-		return genRes{Data: data, Provider: "pollinations"}, nil
+		model := r.Model
+		if model == "" {
+			model = "flux"
+		}
+		return genRes{Data: data, Provider: "pollinations", Model: model}, nil
 	}
 	return genRes{}, lastErr
 }
@@ -409,8 +441,36 @@ func genHorde(r genReq) (genRes, error) {
 	return res, err
 }
 
+// hordeModels elige los modelos. Sin "models" en el payload horde reparte el job
+// entre sus ~180 modelos (SD 1.5, anime NSFW incluidos) y de ahi salen imagenes
+// que no tienen nada que ver con el prompt. Se manda una lista de SDXL buenos:
+// con un solo modelo el job espera 7 min (la cuenta tiene pocos kudos), con la
+// lista termina en ~40s. ?model= fuerza uno puntual y HORDE_MODEL=auto vuelve al
+// comportamiento viejo.
+func hordeModels(r genReq) []string {
+	if m := strings.TrimSpace(r.Model); m != "" {
+		return []string{m}
+	}
+	raw := env("HORDE_MODEL", defaultHordeModels)
+	if raw == "" || strings.EqualFold(raw, "auto") {
+		return nil
+	}
+	var models []string
+	for _, m := range strings.Split(raw, ",") {
+		if m = strings.TrimSpace(m); m != "" {
+			models = append(models, m)
+		}
+	}
+	return models
+}
+
+// modelos sin filtros raros: nada de anime/NSFW ni destilados de 4 pasos
+const defaultHordeModels = "Juggernaut XL,AlbedoBase XL (SDXL),AlbedoBase XL 3.1," +
+	"Deliberate 3.0,Deliberate,AbsoluteReality,Nova Flat XL,URPM,2DN,AAM XL," +
+	"Counterfeit,Anything Diffusion,Hassaku XL,526Mix-Animated"
+
 func hordeJob(r genReq, key string, w, h int) (genRes, error) {
-	payload, _ := json.Marshal(map[string]any{
+	body := map[string]any{
 		"prompt": r.Prompt,
 		"params": map[string]any{
 			"width":  w,
@@ -419,7 +479,11 @@ func hordeJob(r genReq, key string, w, h int) (genRes, error) {
 			"n":      1,
 		},
 		"nsfw": false,
-	})
+	}
+	if models := hordeModels(r); len(models) > 0 {
+		body["models"] = models
+	}
+	payload, _ := json.Marshal(body)
 
 	req, _ := http.NewRequest("POST", "https://stablehorde.net/api/v2/generate/async", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
@@ -457,6 +521,7 @@ func hordeJob(r genReq, key string, w, h int) (genRes, error) {
 			Faulted     bool `json:"faulted"`
 			Generations []struct {
 				Img      string `json:"img"`
+				Model    string `json:"model"`
 				Censored bool   `json:"censored"`
 			} `json:"generations"`
 		}
@@ -476,7 +541,13 @@ func hordeJob(r genReq, key string, w, h int) (genRes, error) {
 			if ext, _ := sniffExt(data); ext == "" {
 				return genRes{}, fmt.Errorf("horde devolvio algo que no es imagen")
 			}
-			return genRes{Data: data, Provider: "horde"}, nil
+			model := done.Generations[0].Model
+			if model == "" {
+				if ms := hordeModels(r); len(ms) > 0 {
+					model = ms[0]
+				}
+			}
+			return genRes{Data: data, Provider: "horde", Model: model}, nil
 		}
 	}
 	return genRes{}, fmt.Errorf("horde: timeout esperando la imagen")
@@ -516,12 +587,17 @@ func generate(r genReq, only string) (genRes, []string) {
 			if err != nil && r.pollKeyValue() != "" {
 				fb := r
 				if fb.Model == "" {
+					// flux.1-dev no existe en pollinations (400) y 1.1-pro cuesta
+					// $0.03 por imagen: schnell es el unico que entra en el saldo
 					fb.Model = "black-forest-labs/flux.1-schnell"
 				}
 				var res2 genRes
 				res2, err = genPollinations(fb)
 				if err == nil {
 					res2.Provider = "flux"
+					if res2.Model == "" {
+						res2.Model = fb.Model
+					}
 					res = res2
 				}
 			}
@@ -751,7 +827,7 @@ func handleGenerate(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			stats.CacheHits++
 			mu.Unlock()
-			serveFile(w, r, p, req, "cache", time.Since(start), wantJSON, wantB64)
+			serveFile(w, r, p, req, "cache", "", time.Since(start), wantJSON, wantB64)
 			return
 		}
 	}
@@ -781,25 +857,25 @@ func handleGenerate(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	if p != "" {
-		serveFile(w, r, p, req, res.Provider, time.Since(start), wantJSON, wantB64)
+		serveFile(w, r, p, req, res.Provider, res.Model, time.Since(start), wantJSON, wantB64)
 		return
 	}
 	// sin cache no hay archivo que servir: se responde con los bytes en mano
-	serveBytes(w, r, res.Data, req, res.Provider, time.Since(start), wantJSON, wantB64, "")
+	serveBytes(w, r, res.Data, req, res.Provider, res.Model, time.Since(start), wantJSON, wantB64, "")
 }
 
-func serveFile(w http.ResponseWriter, r *http.Request, path string, req genReq, provider string, took time.Duration, wantJSON, wantB64 bool) {
+func serveFile(w http.ResponseWriter, r *http.Request, path string, req genReq, provider, model string, took time.Duration, wantJSON, wantB64 bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "no se pudo leer la imagen"})
 		return
 	}
 	id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	serveBytes(w, r, data, req, provider, took, wantJSON, wantB64, id)
+	serveBytes(w, r, data, req, provider, model, took, wantJSON, wantB64, id)
 }
 
 // serveBytes arma la respuesta; con id vacio la imagen no quedo guardada.
-func serveBytes(w http.ResponseWriter, r *http.Request, data []byte, req genReq, provider string, took time.Duration, wantJSON, wantB64 bool, id string) {
+func serveBytes(w http.ResponseWriter, r *http.Request, data []byte, req genReq, provider, model string, took time.Duration, wantJSON, wantB64 bool, id string) {
 	_, mimeType := sniffExt(data)
 	if mimeType == "" && id != "" {
 		mimeType = mime.TypeByExtension(filepath.Ext(id))
@@ -815,6 +891,7 @@ func serveBytes(w http.ResponseWriter, r *http.Request, data []byte, req genReq,
 			"height":   req.Height,
 			"seed":     req.Seed,
 			"provider": provider,
+			"model":    model,
 			"took_ms":  int(took.Milliseconds()),
 			"mime":     mimeType,
 		}
@@ -831,6 +908,9 @@ func serveBytes(w http.ResponseWriter, r *http.Request, data []byte, req genReq,
 	cors(w)
 	w.Header().Set("Content-Type", mimeType)
 	w.Header().Set("X-Provider", provider)
+	if model != "" {
+		w.Header().Set("X-Model", model)
+	}
 	w.Header().Set("X-Took-Ms", strconv.Itoa(int(took.Milliseconds())))
 	if req.Seed != 0 {
 		w.Header().Set("X-Seed", strconv.FormatInt(req.Seed, 10))

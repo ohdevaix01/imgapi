@@ -14,6 +14,8 @@ services:
       POLLINATIONS_TOKEN: ${POLLINATIONS_TOKEN:-}
       # apikey anonima de stable horde
       HORDE_API_KEY: ${HORDE_API_KEY:-0000000000}
+      # modelos que acepta horde, separados por coma (auto = cualquiera)
+      HORDE_MODEL: ${HORDE_MODEL:-}
       # si la pones, todas las peticiones a /generate la exigen
       API_KEY: ${API_KEY:-}
       # segundos que una imagen queda en cache (7 dias)
@@ -26,3 +28,11 @@ services:
       POLLINATIONS_MIN_GAP_MS: ${POLLINATIONS_MIN_GAP_MS:-45000}
     volumes:
       - ./data:/data
+
+# la red por defecto de docker sale con MTU 1500 y el handshake TLS contra
+# stablehorde.net se cuelga (el path no hace PMTUD). Con 1400 anda bien.
+networks:
+  default:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: "1400"

@@ -28,6 +28,20 @@ diciendo `flux`.
 En `horde`, una cuenta recien creada tiene 0 kudos: el servicio intenta el tamano pedido
 y, si el servidor lo rechaza por falta de kudos, reenvia el trabajo a 576x576.
 
+`flux` corre sobre FLUX.1-dev (el modelo completo, con `guidance_scale` en 3.5), que sigue
+el prompt mucho mejor que FLUX.1-schnell: schnell es destilado y trabaja con CFG 0, por eso
+tiende a ignorar partes del prompt. Si dev se queda sin cuota ZeroGPU, se cae a schnell.
+Los Spaces se cambian con `FLUX_SPACE` y `FLUX_SPACE_FALLBACK`.
+
+`horde` necesita que se le diga que modelos usar: sin el campo `models` reparte el trabajo
+entre sus ~180 modelos, incluidos SD 1.5 y modelos de anime NSFW, y el resultado no tiene
+nada que ver con el prompt. El servicio manda una lista de SDXL buenos (ver
+`HORDE_MODEL`); con `?model=` se fuerza uno puntual y con `HORDE_MODEL=auto` vuelve al
+comportamiento viejo.
+
+Cada respuesta trae el motor que la genero: el header `X-Model` en la imagen directa y el
+campo `model` en la respuesta JSON.
+
 ## Uso rapido
 
 ```bash
