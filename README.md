@@ -86,6 +86,12 @@ no se vuelve a generar: sale del disco en menos de 1 ms. Sobrevive a los reinici
 Se controla con `CACHE_TTL` en segundos. Con `cache=0` se saltea la lectura y tambien la
 escritura: cada pedido genera una imagen nueva y no deja nada en disco.
 
+Con `cache=0` y sin `seed` explicito, el servicio genera un seed aleatorio y lo devuelve en
+el header `X-Seed`. Es necesario porque algunos proveedores (Pollinations) cachean la imagen
+por prompt del lado del servidor: sin un seed nuevo devolverian siempre la misma. La respuesta
+tambien sale con `Cache-Control: no-store` para que no quede en el navegador ni en un proxy.
+Si mandas `seed` explicito se respeta, y la imagen se repite aunque el cache este apagado.
+
 ## API key
 
 Si defines `API_KEY`, `/generate` la exige. Se puede pasar por el header `X-API-Key`

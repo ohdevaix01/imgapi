@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"math/rand"
 	"mime"
 	"net/http"
 	"net/url"
@@ -656,6 +657,11 @@ func parseReq(r *http.Request) (genReq, error) {
 	out.Width = round64(out.Width)
 	out.Height = round64(out.Height)
 	out.Width, out.Height = limitPixels(out.Width, out.Height, maxPixels)
+	// con cache apagada, un seed aleatorio evita que el proveedor devuelva
+	// siempre la misma imagen: pollinations cachea por prompt del lado suyo
+	if !out.Cache && out.Seed == 0 {
+		out.Seed = rand.Int63n(1<<31-1) + 1
+	}
 	return out, nil
 }
 
@@ -826,7 +832,17 @@ func serveBytes(w http.ResponseWriter, r *http.Request, data []byte, req genReq,
 	w.Header().Set("Content-Type", mimeType)
 	w.Header().Set("X-Provider", provider)
 	w.Header().Set("X-Took-Ms", strconv.Itoa(int(took.Milliseconds())))
-	w.Header().Set("Cache-Control", "public, max-age=86400")
+	if req.Seed != 0 {
+		w.Header().Set("X-Seed", strconv.FormatInt(req.Seed, 10))
+	}
+	// con cache apagada la respuesta no debe quedar en el navegador ni en
+	// ningun proxy: si no, el mismo pedido devuelve la imagen vieja al instante
+	if req.Cache {
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+	} else {
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+	}
 	w.Write(data)
 }
 
