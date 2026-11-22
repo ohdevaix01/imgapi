@@ -35,23 +35,27 @@ type Provider struct {
 }
 
 var (
-	port      = env("PORT", "8080")
-	dataDir   = env("DATA_DIR", "/data")
-	cacheTTL  = time.Duration(envInt("CACHE_TTL", 604800)) * time.Second
-	genTO     = time.Duration(envInt("GEN_TIMEOUT", 180)) * time.Second
-	apiKey    = os.Getenv("API_KEY")
-	hfToken   = os.Getenv("HF_TOKEN")
-	pollKey   = os.Getenv("POLLINATIONS_TOKEN")
-	order     = strings.Split(env("PROVIDER_ORDER", "flux,pollinations,horde"), ",")
-	minGapMs  = envInt("POLLINATIONS_MIN_GAP_MS", 45000)
+	port     = env("PORT", "8080")
+	dataDir  = env("DATA_DIR", "/data")
+	cacheTTL = time.Duration(envInt("CACHE_TTL", 604800)) * time.Second
+	genTO    = time.Duration(envInt("GEN_TIMEOUT", 180)) * time.Second
+	apiKey   = os.Getenv("API_KEY")
+	hfToken  = os.Getenv("HF_TOKEN")
+	pollKey  = os.Getenv("POLLINATIONS_TOKEN")
+	order    = strings.Split(env("PROVIDER_ORDER", "flux,pollinations,horde"), ",")
+	minGapMs = envInt("POLLINATIONS_MIN_GAP_MS", 45000)
 	// techo de pixeles medido en la API nueva de pollinations; mas que esto
 	// devuelve 422
 	maxPixels = envInt("MAX_PIXELS", 2300000)
 
-	mu        sync.RWMutex
-	stats     Stats
-	lastPoll  time.Time
-	pollMu    sync.Mutex
+	// validar contra los proveedores que existen, no contra PROVIDER_ORDER:
+	// si no, forzar uno que no esta en el orden da "proveedor desconocido"
+	knownProviders = map[string]bool{"flux": true, "pollinations": true, "horde": true}
+
+	mu       sync.RWMutex
+	stats    Stats
+	lastPoll time.Time
+	pollMu   sync.Mutex
 )
 
 func env(k, d string) string {
@@ -179,6 +183,7 @@ type genRes struct {
 // Con HF_TOKEN la cuota de ZeroGPU es mucho mayor.
 func genFlux(r genReq) (genRes, error) {
 	space := env("FLUX_SPACE", "https://black-forest-labs-flux-1-schnell.hf.space")
+	session := fmt.Sprintf("imgapi%d", time.Now().UnixNano())
 	body, _ := json.Marshal(map[string]any{
 		"data": []any{
 			r.Prompt,
@@ -188,7 +193,7 @@ func genFlux(r genReq) (genRes, error) {
 			float64(r.Height),
 			4,
 		},
-		"session_hash": fmt.Sprintf("imgapi%d", time.Now().UnixNano()),
+		"session_hash": session,
 	})
 
 	req, err := http.NewRequest("POST", space+"/gradio_api/call/infer", bytes.NewReader(body))
@@ -200,13 +205,12 @@ func genFlux(r genReq) (genRes, error) {
 		req.Header.Set("Authorization", "Bearer "+k)
 	}
 
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
 	if err != nil {
 		return genRes{}, err
 	}
-	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		return genRes{}, fmt.Errorf("flux call HTTP %d: %s", resp.StatusCode, truncate(string(raw), 200))
 	}
@@ -218,7 +222,10 @@ func genFlux(r genReq) (genRes, error) {
 		return genRes{}, fmt.Errorf("flux sin event_id: %s", truncate(string(raw), 200))
 	}
 
-	sseReq, _ := http.NewRequest("GET", space+"/gradio_api/call/infer/"+started.EventID, nil)
+	// gradio cambio el protocolo: el resultado ya no sale por
+	// /call/<fn>/<event_id> sino por /queue/data?session_hash=..., con
+	// msg=process_completed y la imagen adentro de output.data.
+	sseReq, _ := http.NewRequest("GET", space+"/gradio_api/queue/data?session_hash="+session, nil)
 	if k := r.hfKey(); k != "" {
 		sseReq.Header.Set("Authorization", "Bearer "+k)
 	}
@@ -228,56 +235,84 @@ func genFlux(r genReq) (genRes, error) {
 	}
 	defer sseResp.Body.Close()
 
-	// El stream SSE manda "event: complete" y despues "data: [{url}, seed]".
-	// La url apunta al archivo del Space y hay que descargarla aparte.
 	scanner := bufio.NewScanner(sseResp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	var event, dataLine string
 	for scanner.Scan() {
 		line := scanner.Text()
-		switch {
-		case strings.HasPrefix(line, "event:"):
-			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-		case strings.HasPrefix(line, "data:"):
-			dataLine = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		}
-		if event == "error" {
-			return genRes{}, fmt.Errorf("flux: error del Space: %s", truncate(dataLine, 200))
-		}
-		if event != "complete" || dataLine == "" {
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		var payload []struct {
-			URL  string `json:"url"`
-			Path string `json:"path"`
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" {
+			continue
 		}
-		if err := json.Unmarshal([]byte(dataLine), &payload); err != nil || len(payload) == 0 {
-			return genRes{}, fmt.Errorf("flux: payload inesperado: %s", truncate(dataLine, 200))
+		var msg struct {
+			Msg     string `json:"msg"`
+			EventID string `json:"event_id"`
+			Success bool   `json:"success"`
+			Output  struct {
+				// array mixto: [ {file de la imagen}, seed(number) ]
+				Data []json.RawMessage `json:"data"`
+			} `json:"output"`
 		}
-		target := payload[0].URL
-		if target == "" && payload[0].Path != "" {
-			target = space + "/gradio_api/file=" + payload[0].Path
+		if err := json.Unmarshal([]byte(payload), &msg); err != nil {
+			continue
 		}
-		if target == "" {
-			return genRes{}, fmt.Errorf("flux: sin url de imagen")
+		// el stream es de toda la sesion; ignorar eventos de otro pedido
+		if msg.EventID != "" && msg.EventID != started.EventID {
+			continue
 		}
-		if strings.HasPrefix(target, "/") {
-			target = space + target
+		if msg.Msg == "process_generating" || msg.Msg == "estimation" ||
+			msg.Msg == "process_starts" || msg.Msg == "progress" ||
+			msg.Msg == "queue_full" || msg.Msg == "heartbeat" {
+			continue
 		}
-		imgReq, _ := http.NewRequest("GET", target, nil)
-		if k := r.hfKey(); k != "" {
-			imgReq.Header.Set("Authorization", "Bearer "+k)
+		if msg.Msg == "close_stream" {
+			break
 		}
-		imgResp, err := (&http.Client{Timeout: 90 * time.Second}).Do(imgReq)
-		if err != nil {
-			return genRes{}, err
+		if msg.Msg == "process_completed" {
+			if !msg.Success {
+				return genRes{}, fmt.Errorf("flux: el Space fallo al generar: %s", truncate(payload, 400))
+			}
+			if len(msg.Output.Data) == 0 {
+				return genRes{}, fmt.Errorf("flux: respuesta sin imagen")
+			}
+			// el primer elemento es el archivo; los demas son escalares (seed)
+			var file struct {
+				URL  string `json:"url"`
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal(msg.Output.Data[0], &file); err != nil || (file.URL == "" && file.Path == "") {
+				return genRes{}, fmt.Errorf("flux: respuesta sin archivo: %s", truncate(string(msg.Output.Data[0]), 200))
+			}
+			target := file.URL
+			if target == "" {
+				target = space + "/gradio_api/file=" + file.Path
+			}
+			if target == "" {
+				return genRes{}, fmt.Errorf("flux: sin url de imagen")
+			}
+			if strings.HasPrefix(target, "/") {
+				target = space + target
+			}
+			imgReq, _ := http.NewRequest("GET", target, nil)
+			if k := r.hfKey(); k != "" {
+				imgReq.Header.Set("Authorization", "Bearer "+k)
+			}
+			imgResp, err := (&http.Client{Timeout: 90 * time.Second}).Do(imgReq)
+			if err != nil {
+				return genRes{}, err
+			}
+			data, _ := io.ReadAll(imgResp.Body)
+			imgResp.Body.Close()
+			if ext, _ := sniffExt(data); ext == "" {
+				return genRes{}, fmt.Errorf("flux: la descarga no es imagen")
+			}
+			return genRes{Data: data, Provider: "flux"}, nil
 		}
-		data, _ := io.ReadAll(imgResp.Body)
-		imgResp.Body.Close()
-		if ext, _ := sniffExt(data); ext == "" {
-			return genRes{}, fmt.Errorf("flux: la descarga no es imagen")
-		}
-		return genRes{Data: data, Provider: "flux"}, nil
+	}
+	if err := scanner.Err(); err != nil {
+		return genRes{}, err
 	}
 	return genRes{}, fmt.Errorf("flux: stream sin imagen utilizable")
 }
@@ -447,17 +482,20 @@ func hordeJob(r genReq, key string, w, h int) (genRes, error) {
 }
 
 func validProvider(name string) bool {
-	for _, p := range order {
-		if strings.TrimSpace(p) == name {
-			return true
-		}
-	}
-	return false
+	return knownProviders[name]
 }
 
+// generate recorre los proveedores. Si se fuerza uno, se usa ese solo, este o no
+// en PROVIDER_ORDER: forzar flux no debe depender de que este en el orden.
 func generate(r genReq, only string) (genRes, []string) {
 	var failures []string
-	for _, name := range order {
+
+	candidates := order
+	if only != "" {
+		candidates = []string{only}
+	}
+
+	for _, name := range candidates {
 		name = strings.TrimSpace(name)
 		if name == "" {
 			continue
@@ -472,6 +510,20 @@ func generate(r genReq, only string) (genRes, []string) {
 		switch name {
 		case "flux":
 			res, err = genFlux(r)
+			// el Space de HF tiene una cuota ZeroGPU chica que se agota seguido;
+			// con key de pollinations ahi tambien hay FLUX y sin ese tope
+			if err != nil && r.pollKeyValue() != "" {
+				fb := r
+				if fb.Model == "" {
+					fb.Model = "black-forest-labs/flux.1-schnell"
+				}
+				var res2 genRes
+				res2, err = genPollinations(fb)
+				if err == nil {
+					res2.Provider = "flux"
+					res = res2
+				}
+			}
 		case "pollinations":
 			res, err = genPollinations(r)
 		case "horde":
@@ -525,18 +577,18 @@ func parseReq(r *http.Request) (genReq, error) {
 
 	if r.Method == "POST" {
 		var body struct {
-			Prompt         string `json:"prompt"`
-			Width          int    `json:"width"`
-			Height         int    `json:"height"`
-			Seed           int64  `json:"seed"`
-			Model          string `json:"model"`
-			Provider       string `json:"provider"`
-			HFToken        string `json:"hf_token"`
-			PollToken      string `json:"pollinations_token"`
-			HordeToken     string `json:"horde_token"`
-			Cache          *bool  `json:"cache"`
-			Format         string `json:"format"`
-			B64            bool   `json:"b64"`
+			Prompt     string `json:"prompt"`
+			Width      int    `json:"width"`
+			Height     int    `json:"height"`
+			Seed       int64  `json:"seed"`
+			Model      string `json:"model"`
+			Provider   string `json:"provider"`
+			HFToken    string `json:"hf_token"`
+			PollToken  string `json:"pollinations_token"`
+			HordeToken string `json:"horde_token"`
+			Cache      *bool  `json:"cache"`
+			Format     string `json:"format"`
+			B64        bool   `json:"b64"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			return out, fmt.Errorf("json invalido")
@@ -671,7 +723,7 @@ func handleGenerate(w http.ResponseWriter, r *http.Request) {
 	if only != "" && !validProvider(only) {
 		writeJSON(w, 400, map[string]any{
 			"error":     "proveedor desconocido",
-			"providers": order,
+			"providers": []string{"flux", "pollinations", "horde"},
 		})
 		return
 	}
@@ -810,11 +862,11 @@ func main() {
 		writeJSON(w, 200, map[string]any{
 			"status": "ok",
 			"providers": map[string]any{
-				"order":             order,
-				"flux_token":        hfToken != "",
-				"pollinations_key":  pollKey != "",
+				"order":            order,
+				"flux_token":       hfToken != "",
+				"pollinations_key": pollKey != "",
 			},
-			"cache_ttl":  int(cacheTTL.Seconds()),
+			"cache_ttl":   int(cacheTTL.Seconds()),
 			"api_key_set": apiKey != "",
 		})
 	})

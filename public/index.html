@@ -116,7 +116,7 @@
         <label for="prov">Proveedor</label>
         <select id="prov">
           <option value="">automatico (con failover)</option>
-          <option value="flux">flux (mejor calidad, necesita token)</option>
+          <option value="flux">flux (mejor calidad, necesita token HF)</option>
           <option value="pollinations">pollinations (sin key, 1 cada 45s)</option>
           <option value="horde">horde (sin key, mas lento)</option>
         </select>
@@ -127,10 +127,16 @@
       </div>
     </div>
 
-    <label style="display:flex; align-items:center; gap:8px; margin-top:14px; font-weight:400">
-      <input id="cache" type="checkbox" checked style="width:auto">
-      Usar cache (destildalo para que genere una imagen nueva aunque el prompt sea el mismo)
-    </label>
+    <div class="row">
+      <div>
+        <label for="cache">Cache</label>
+        <select id="cache">
+          <option value="0" selected>no (genera siempre una imagen nueva)</option>
+          <option value="1">si (reusa si el pedido es identico)</option>
+        </select>
+      </div>
+      <div></div>
+    </div>
 
     <details style="margin-top:16px">
       <summary style="cursor:pointer; color:var(--muted); font-size:14px">Claves de los proveedores (opcional, no se guardan)</summary>
@@ -227,7 +233,7 @@ $('go').addEventListener('click', async () => {
   if ($('seed').value && $('seed').value !== '0') p.set('seed', $('seed').value);
   if ($('prov').value) p.set('provider', $('prov').value);
   if ($('key').value) p.set('key', $('key').value);
-  if (!$('cache').checked) p.set('cache', '0');
+  p.set('cache', $('cache').value);
   if ($('hfk').value) p.set('hf_token', $('hfk').value);
   if ($('pollk').value) p.set('pollinations_token', $('pollk').value);
   if ($('hordek').value) p.set('horde_token', $('hordek').value);

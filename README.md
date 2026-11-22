@@ -11,15 +11,19 @@ unos pocos MB de RAM. No necesita GPU propia: usa proveedores externos gratuitos
 
 | Proveedor | Token | Limite sin token | Velocidad tipica |
 |---|---|---|---|
-| `flux` | HF_TOKEN (gratis) | ~3 imagenes y corta | 10 s |
+| `flux` | HF_TOKEN (gratis) | cuota ZeroGPU de ~5 min por dia | 10 s |
 | `pollinations` | POLLINATIONS_TOKEN (gratis) | 1 imagen cada 45 s por IP | 4 s |
 | `horde` | HORDE_API_KEY (gratis) | tope de 576x576 sin kudos | 30 s |
 
 El orden de intento se configura con `PROVIDER_ORDER`. Si el primero falla, pasa al
-siguiente sin que el cliente se entere.
+siguiente sin que el cliente se entere. Forzar `?provider=` no depende de esa lista:
+funciona aunque el proveedor no este en el orden.
 
 Con `POLLINATIONS_TOKEN` el servicio usa la API nueva (`gen.pollinations.ai`), que no
-tiene el limite de 45 s. Sin token usa la clasica, con ese limite.
+tiene el limite de 45 s y ademas sirve los modelos de FLUX. Por eso, si `flux` falla por
+cuota de ZeroGPU y hay key de Pollinations, la imagen se genera igual: sale por
+Pollinations con el modelo `black-forest-labs/flux.1-schnell` y la respuesta sigue
+diciendo `flux`.
 
 En `horde`, una cuenta recien creada tiene 0 kudos: el servicio intenta el tamano pedido
 y, si el servidor lo rechaza por falta de kudos, reenvia el trabajo a 576x576.
@@ -56,7 +60,7 @@ curl "http://localhost:8080/generate?prompt=un+gato+negro&b64=1"
 | `seed` | 0 | con el mismo seed repite la misma imagen |
 | `model` | — | pasa el modelo al proveedor |
 | `provider` | — | fuerza `flux`, `pollinations` o `horde` |
-| `cache=0` | cache activa | desactiva lectura y escritura de cache |
+| `cache=0` | desactivada | cache activa (por defecto esta apagada en el demo) |
 | `format=json` | — | devuelve JSON con `image_url` |
 | `b64=1` | — | devuelve JSON con la imagen en base64 |
 | `hf_token` | `HF_TOKEN` | token de HuggingFace solo para ese pedido |
